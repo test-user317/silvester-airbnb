@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airbnb – frei für Silvester</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,"Segoe UI",Roboto,sans-serif;background:#f4f2ee;color:#1d1d1f}
+header{position:sticky;top:0;z-index:5;background:rgba(244,242,238,.92);backdrop-filter:blur(8px);
+  border-bottom:1px solid #e2ded6;padding:14px 24px;display:flex;flex-wrap:wrap;gap:8px 24px;align-items:center}
+h1{font-size:20px;margin:0;font-weight:700}
+.suche{font-size:13px;color:#6b6760;margin-top:2px}
+.rechts{margin-left:auto;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+.live{font-size:13px;color:#6b6760;display:flex;align-items:center;gap:7px}
+.punkt{width:9px;height:9px;border-radius:50%;background:#2fa66a;box-shadow:0 0 0 0 rgba(47,166,106,.6);animation:puls 2s infinite}
+.alt .punkt{background:#d98b1f;animation:none}
+@keyframes puls{70%{box-shadow:0 0 0 8px rgba(47,166,106,0)}100%{box-shadow:0 0 0 0 rgba(47,166,106,0)}}
+select{font:inherit;font-size:14px;padding:7px 10px;border-radius:10px;border:1px solid #d5d0c6;background:#fff;color:inherit}
+main{padding:20px 24px 48px}
+.raster{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
+.kachel{position:relative;display:block;aspect-ratio:1/1;border-radius:18px;overflow:hidden;background:#d9d5cc;
+  color:#fff;text-decoration:none;box-shadow:0 1px 3px rgba(0,0,0,.12);transition:transform .15s,box-shadow .15s}
+.kachel:hover{transform:translateY(-3px);box-shadow:0 10px 24px rgba(0,0,0,.18)}
+.kachel img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.kachel::after{content:"";position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.82) 0%,rgba(0,0,0,.35) 38%,rgba(0,0,0,0) 62%)}
+.text{position:absolute;left:14px;right:14px;bottom:12px;z-index:2}
+.name{font-weight:700;font-size:16px;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.details{font-size:12.5px;opacity:.85;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.zeile{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-top:8px;font-size:13.5px}
+.preis b{font-size:18px}
+.marke{position:absolute;z-index:2;top:12px;padding:5px 10px;border-radius:999px;font-size:12.5px;font-weight:700}
+.stern{right:12px;background:rgba(255,255,255,.94);color:#1d1d1f}
+.neu{left:12px;background:#ff385c;color:#fff}
+.pfeil{position:absolute;z-index:3;top:42%;width:34px;height:34px;border-radius:50%;border:0;background:rgba(255,255,255,.92);
+  color:#1d1d1f;font-size:18px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s}
+.kachel:hover .pfeil{opacity:1} .pfeil.l{left:10px} .pfeil.r{right:10px}
+.frisch{animation:blink 1.6s ease-out 2}
+@keyframes blink{0%{box-shadow:0 0 0 0 rgba(255,56,92,.9)}100%{box-shadow:0 0 0 18px rgba(255,56,92,0)}}
+.leer{padding:80px 20px;text-align:center;color:#6b6760;font-size:16px}
+@media (max-width:600px){header,main{padding-left:14px;padding-right:14px}.raster{grid-template-columns:1fr;gap:14px}.pfeil{opacity:.9;top:34%}}
+</style></head><body>
+<header>
+  <div><h1 id="titel">Unterkünfte werden geladen …</h1><div class="suche" id="suche"></div></div>
+  <div class="rechts">
+    <div class="live" id="live"><span class="punkt"></span><span id="stand">wartet auf den ersten Durchlauf</span></div>
+    <select id="sortierung" aria-label="Sortierung">
+      <option value="neu">Neu frei zuerst</option>
+      <option value="fahrzeit">Kürzeste Fahrt</option>
+      <option value="preis">Günstigster Preis</option>
+      <option value="bewertung">Beste Bewertung</option>
+    </select>
+  </div>
+</header>
+<main>
+  <div class="raster" id="raster"></div>
+  <div class="leer" id="leer">Der erste Durchlauf läuft gerade. Die Unterkünfte erscheinen hier von selbst, du musst nichts neu laden.</div>
+</main>
+<script>
+var daten = null, karten = {}, ersterAufbau = true;
+var raster = document.getElementById('raster'), auswahl = document.getElementById('sortierung');
+try { auswahl.value = localStorage.getItem('sortierung') || 'neu'; } catch (e) {}
+if (!auswahl.value) auswahl.value = 'neu';
+auswahl.onchange = function () { try { localStorage.setItem('sortierung', auswahl.value); } catch (e) {} zeichnen(false); };
+
+function el(tag, klasse, text) { var e = document.createElement(tag); if (klasse) e.className = klasse; if (text != null) e.textContent = text; return e; }
+function zahl(t) { return parseFloat(String(t || '0').replace(',', '.')) || 0; }
+
+function karteBauen(d) {
+  var a = el('a', 'kachel'); a.target = '_blank'; a.rel = 'noopener';
+  var bild = el('img'); bild.loading = 'lazy'; bild.referrerPolicy = 'no-referrer'; bild.alt = '';
+  a.appendChild(bild); a._bild = bild; a._nr = 0;
+  a._neu = el('span', 'marke neu', 'NEU FREI'); a.appendChild(a._neu);
+  a._stern = el('span', 'marke stern'); a.appendChild(a._stern);
+  ['l', 'r'].forEach(function (seite) {
+    var p = el('button', 'pfeil ' + seite, seite === 'l' ? '‹' : '›'); p.type = 'button';
+    p.setAttribute('aria-label', seite === 'l' ? 'Vorheriges Bild' : 'Nächstes Bild');
+    p.onclick = function (ev) { ev.preventDefault(); ev.stopPropagation();
+      var b = a._daten.bilder; if (!b.length) return;
+      a._nr = (a._nr + (seite === 'l' ? b.length - 1 : 1)) % b.length; bild.src = b[a._nr] + '?im_w=720'; };
+    a.appendChild(p);
+  });
+  var t = el('div', 'text');
+  a._name = el('div', 'name'); a._details = el('div', 'details');
+  var z = el('div', 'zeile'); a._preis = el('span', 'preis'); a._fahrt = el('span');
+  z.appendChild(a._preis); z.appendChild(a._fahrt);
+  t.appendChild(a._name); t.appendChild(a._details); t.appendChild(z); a.appendChild(t);
+  return a;
+}
+
+function karteFuellen(a, d) {
+  a._daten = d; a.href = d.url;
+  var erstes = d.bilder.length ? d.bilder[Math.min(a._nr, d.bilder.length - 1)] + '?im_w=720' : '';
+  if (erstes && a._bild.getAttribute('src') !== erstes) a._bild.src = erstes;
+  a._neu.style.display = d.neu ? '' : 'none';
+  a._stern.textContent = d.bewertung ? '★ ' + d.bewertung : ''; a._stern.style.display = d.bewertung ? '' : 'none';
+  a._name.textContent = d.name; a._details.textContent = d.details;
+  a._preis.textContent = ''; a._preis.appendChild(el('b', null, d.preis_text));
+  if (d.pro_kopf) a._preis.appendChild(document.createTextNode('  ·  ' + d.pro_kopf + ' € p. P.'));
+  a._fahrt.textContent = '🚗 ' + d.fahrzeit_text;
+}
+
+function zeichnen(markieren) {
+  if (!daten) return;
+  var liste = daten.eintraege.slice(), art = auswahl.value;
+  liste.sort(function (x, y) {
+    if (art === 'preis') return (x.preis || 1e9) - (y.preis || 1e9) || x.fahrzeit - y.fahrzeit;
+    if (art === 'bewertung') return zahl(y.bewertung) - zahl(x.bewertung) || x.fahrzeit - y.fahrzeit;
+    if (art === 'neu') return (y.neu - x.neu) || (y.gemeldet > x.gemeldet ? 1 : y.gemeldet < x.gemeldet ? -1 : 0) || x.fahrzeit - y.fahrzeit;
+    return x.fahrzeit - y.fahrzeit;
+  });
+  var da = {};
+  liste.forEach(function (d) {
+    var k = karten[d.id], frisch = !k;
+    if (!k) k = karten[d.id] = karteBauen(d);
+    karteFuellen(k, d); da[d.id] = 1;
+    if (frisch && markieren && !ersterAufbau) k.classList.add('frisch');
+    raster.appendChild(k);
+  });
+  Object.keys(karten).forEach(function (id) { if (!da[id]) { karten[id].remove(); delete karten[id]; } });
+  var n = liste.length, neu = liste.filter(function (d) { return d.neu; }).length;
+  document.getElementById('titel').textContent = n + (n === 1 ? ' Unterkunft frei' : ' Unterkünfte frei') + (neu ? '  ·  ' + neu + ' neu' : '');
+  document.title = (neu ? '(' + neu + ' neu) ' : '') + n + ' frei – Airbnb Silvester';
+  document.getElementById('suche').textContent = daten.suche;
+  document.getElementById('leer').style.display = n ? 'none' : '';
+  if (!n) document.getElementById('leer').textContent = 'Gerade ist nichts Passendes frei. Die Seite aktualisiert sich von selbst.';
+  ersterAufbau = false;
+}
+
+function standZeigen() {
+  if (!daten) return;
+  var min = Math.max(0, Math.round((Date.now() / 1000 - daten.stand) / 60));
+  var alt = min > daten.intervall_min * 3 + 15;
+  document.getElementById('live').className = 'live' + (alt ? ' alt' : '');
+  document.getElementById('stand').textContent = alt
+    ? 'Stand vor ' + (min >= 120 ? Math.round(min / 60) + ' h' : min + ' min') + ' – läuft der Wächter noch?'
+    : 'Live · Stand ' + (min < 1 ? 'gerade eben' : 'vor ' + min + ' min');
+}
+
+window.aktualisiere = function (d) {
+  if (daten && daten.stand === d.stand) return;
+  daten = d; zeichnen(true); standZeigen();
+};
+
+function nachladen() {
+  var s = document.createElement('script');
+  s.src = 'airbnb_daten.js?t=' + Date.now();
+  s.onload = s.onerror = function () { s.remove(); };
+  document.head.appendChild(s);
+}
+nachladen(); setInterval(nachladen, 30000); setInterval(standZeigen, 30000);
+</script></body></html>
