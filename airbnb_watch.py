@@ -44,7 +44,7 @@ ZENTRUM_NAME = "Reutlingen"
 ZENTRUM_LAT = 48.4914
 ZENTRUM_LNG = 9.2043
 MAX_FAHRZEIT_STD = 6.0          # Autofahrt ab Reutlingen, ohne Stau und Pausen
-RADIUS_KM = 500                 # grober Vorfilter per Luftlinie (weiter kommt man in 6 h nicht)
+RADIUS_KM = 510                 # grober Vorfilter per Luftlinie, wird aus der Fahrzeit berechnet
 
 CHECKIN = "2026-12-29"
 CHECKOUT = "2027-01-02"
@@ -74,6 +74,7 @@ LOG_DATEI = ORDNER / "airbnb_treffer.log"
 BASIS_URL = "https://www.airbnb.de/s/homes"
 ROUTING_URL = "https://router.project-osrm.org/table/v1/driving/"
 ROUTING_PAKET = 80              # Ziele pro Routing-Anfrage
+MAX_ORTE_PRO_LAUF = 400         # so viele Orte werden pro Durchlauf hoechstens nachgeschlagen
 NAECHTE = 0
 PROFIL = ""
 KANAL = ""                      # ntfy-Thema, ueber das die Seite Aenderungen an der Suche schickt
@@ -94,9 +95,10 @@ class AbrufFehler(Exception):
 
 
 def profil_berechnen():
-    """Leitet Naechte und Suchprofil aus den aktuellen Einstellungen ab."""
-    global NAECHTE, PROFIL
+    """Leitet Naechte, Suchradius und Suchprofil aus den aktuellen Einstellungen ab."""
+    global NAECHTE, PROFIL, RADIUS_KM
     NAECHTE = (datetime.strptime(CHECKOUT, "%Y-%m-%d") - datetime.strptime(CHECKIN, "%Y-%m-%d")).days
+    RADIUS_KM = round(MAX_FAHRZEIT_STD * 85)    # weiter kommt man per Luftlinie in der Zeit nicht
     PROFIL = "|".join(str(x) for x in (
         ZENTRUM_LAT, ZENTRUM_LNG, MAX_FAHRZEIT_STD, RADIUS_KM, CHECKIN, CHECKOUT, GAESTE,
         NUR_GAESTE_FAVORIT, NUR_GANZE_UNTERKUNFT, MIN_SCHLAFZIMMER, SAMMEL_MAX_PREIS))
@@ -106,7 +108,7 @@ profil_berechnen()
 
 
 def suche_pruefen(d):
-    """Prueft eine von der Seite geschickte Suche. Gibt (checkin, checkout, gaeste) oder None zurueck."""
+    """Prueft eine von der Seite geschickte Suche. Gibt die bereinigten Werte oder None zurueck."""
     try:
         ein, aus, gaeste = str(d["checkin"]), str(d["checkout"]), int(d["gaeste"])
         if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", ein) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", aus)):
@@ -116,14 +118,25 @@ def suche_pruefen(d):
         if not (1 <= (t2 - t1).days <= 21 and t1 >= heute - timedelta(days=1)
                 and t2 <= heute + timedelta(days=730) and 1 <= gaeste <= 16):
             return None
-        return ein, aus, gaeste
+        sauber = {"checkin": ein, "checkout": aus, "gaeste": gaeste}
+        if d.get("fahrzeit") is not None:
+            fahrzeit = float(d["fahrzeit"])
+            if not 2 <= fahrzeit <= 8:
+                return None
+            sauber["fahrzeit"] = round(fahrzeit * 2) / 2
+        if d.get("preis") is not None:
+            preis = int(d["preis"])
+            if not 500 <= preis <= 5000:
+                return None
+            sauber["preis"] = preis
+        return sauber
     except Exception:
         return None
 
 
 def einstellungen_laden():
     """Liest einstellungen.json und holt neue Aenderungen ab, die jemand auf der Seite gespeichert hat."""
-    global CHECKIN, CHECKOUT, GAESTE, KANAL
+    global CHECKIN, CHECKOUT, GAESTE, KANAL, MAX_FAHRZEIT_STD, SAMMEL_MAX_PREIS
     if not EINSTELL_DATEI.exists():
         return
     try:
@@ -145,17 +158,19 @@ def einstellungen_laden():
                 if suche and (neueste is None or m["time"] > neueste[0]):
                     neueste = (m["time"], suche)
             if neueste:
-                e.update(geaendert=neueste[0], checkin=neueste[1][0], checkout=neueste[1][1], gaeste=neueste[1][2])
+                e.update(neueste[1], geaendert=neueste[0])
                 with open(EINSTELL_DATEI, "w", encoding="utf-8", newline="\n") as f:
                     f.write(json.dumps(e, indent=1) + "\n")
-                log(f"Suche wurde auf der Seite geaendert: {neueste[1][2]} Gaeste, {neueste[1][0]} bis {neueste[1][1]}")
+                log(f"Suche wurde auf der Seite geaendert: {neueste[1]}")
         except Exception as fehler:
             log(f"Aenderungen von der Seite nicht abrufbar ({type(fehler).__name__})")
     else:
         KANAL = ""
     suche = suche_pruefen(e) if "checkin" in e else None
     if suche:
-        CHECKIN, CHECKOUT, GAESTE = suche
+        CHECKIN, CHECKOUT, GAESTE = suche["checkin"], suche["checkout"], suche["gaeste"]
+        MAX_FAHRZEIT_STD = suche.get("fahrzeit", MAX_FAHRZEIT_STD)
+        SAMMEL_MAX_PREIS = suche.get("preis", SAMMEL_MAX_PREIS)
     profil_berechnen()
 
 
@@ -228,11 +243,11 @@ def such_url(k, cursor=None):
     return BASIS_URL + "?" + urllib.parse.urlencode(p)
 
 
-def http_get(url):
+def http_get(url, absender=None):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": USER_AGENT,
+            "User-Agent": absender or USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "de-DE,de;q=0.9",
         },
@@ -403,6 +418,52 @@ def fahrzeiten_ergaenzen(state, treffer):
             fahrzeit_text(minuten) if minuten >= 0 else "keine Route")
 
 
+def ort_nachschlagen(lat, lng):
+    """Fragt Ort und Land zu einer Koordinate ab (OpenStreetMap, als Ersatz Photon)."""
+    absender = "silvester-airbnb-waechter/1.0 (privates Gruppenprojekt)"
+    try:
+        d = json.loads(http_get(
+            "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=10&accept-language=de"
+            f"&lat={lat:.4f}&lon={lng:.4f}", absender))
+        a = d.get("address") or {}
+        if a.get("country"):
+            ort = (a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
+                   or a.get("county") or d.get("name") or "")
+            return {"ort": ort, "land": a["country"], "code": (a.get("country_code") or "").upper()}
+    except Exception:
+        pass
+    try:
+        d = json.loads(http_get(f"https://photon.komoot.io/reverse?lang=de&lat={lat:.4f}&lon={lng:.4f}", absender))
+        e = d["features"][0]["properties"]
+        if e.get("country"):
+            return {"ort": e.get("city") or e.get("locality") or e.get("county") or "",
+                    "land": e["country"], "code": (e.get("countrycode") or "").upper()}
+    except Exception:
+        pass
+    return None
+
+
+def orte_ergaenzen(state, treffer):
+    """Haengt an jeden Treffer Ort und Land an. Jede Unterkunft wird nur einmal nachgeschlagen."""
+    cache = state.setdefault("ort", {})
+    offen = [t for t in treffer.values() if t["id"] not in cache][:MAX_ORTE_PRO_LAUF]
+    fehler = 0
+    for t in offen:
+        ergebnis = ort_nachschlagen(t["lat"], t["lng"])
+        time.sleep(1.1)                     # hoechstens eine Anfrage pro Sekunde
+        if ergebnis:
+            cache[t["id"]] = ergebnis
+            fehler = 0
+        else:
+            fehler += 1
+            if fehler >= 3:
+                log("  Ortssuche nicht erreichbar - wird beim naechsten Durchlauf nachgeholt")
+                break
+    for t in treffer.values():
+        e = cache.get(t["id"]) or {}
+        t["ort"], t["land"], t["land_code"] = e.get("ort", ""), e.get("land", ""), e.get("code", "")
+
+
 def durchlauf(state):
     """Sucht das ganze Gebiet ab. Gibt (Treffer nach ID, vollstaendig?) zurueck."""
     gefunden = {}
@@ -445,6 +506,7 @@ def durchlauf(state):
     fahrzeiten_ergaenzen(state, passend)
     limit = MAX_FAHRZEIT_STD * 60
     passend = {lid: t for lid, t in passend.items() if 0 <= t["fahrzeit"] <= limit}
+    orte_ergaenzen(state, passend)
     log(f"  {len(passend)} passende Unterkuenfte frei ({abrufe} Abrufe)")
     return passend, vollstaendig
 
@@ -460,12 +522,13 @@ def state_laden():
                     log("Sucheinstellungen wurden geaendert - Bestand wird neu aufgenommen")
                 state.update(profil=PROFIL, initialisiert=False, listings={})
             state.setdefault("fahrzeit", {})
+            state.setdefault("ort", {})
             return state
         except ValueError:
             log("Zustandsdatei war kaputt und wird neu angelegt")
     in_der_cloud = bool(os.environ.get("NTFY_TOPIC") or os.environ.get("GITHUB_ACTIONS"))
     return {"topic": "" if in_der_cloud else "airbnb-" + secrets.token_hex(8), "profil": PROFIL,
-            "initialisiert": False, "listings": {}, "fahrzeit": {}}
+            "initialisiert": False, "listings": {}, "fahrzeit": {}, "ort": {}}
 
 
 def push_thema(state):
@@ -510,10 +573,10 @@ def csv_schreiben(aktuell):
     zeilen = sorted(aktuell.values(), key=lambda t: t["fahrzeit"])
     with CSV_DATEI.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["Name", "Gesamtpreis", "Pro Person", "Bewertung", "Fahrzeit", "Luftlinie km", "Details", "Link"])
+        w.writerow(["Name", "Ort", "Land", "Gesamtpreis", "Pro Person", "Bewertung", "Fahrzeit", "Luftlinie km", "Details", "Link"])
         for t in zeilen:
             pro_kopf = f"{round(t['preis'] / GAESTE)} €" if t["preis"] else ""
-            w.writerow([t["name"], t["preis_text"], pro_kopf, t["bewertung"], t["fahrzeit_text"],
+            w.writerow([t["name"], t.get("ort", ""), t.get("land", ""), t["preis_text"], pro_kopf, t["bewertung"], t["fahrzeit_text"],
                         t["km"], t["details"], t["url"]])
 
 
@@ -530,6 +593,7 @@ def daten_schreiben(state, aktuell):
             "bewertung": t["bewertung"], "fahrzeit": t["fahrzeit"],
             "fahrzeit_text": t["fahrzeit_text"], "details": t["details"],
             "betten": t.get("betten", 0), "schlafzimmer": t.get("schlafzimmer", 0), "baeder": t.get("baeder", 0),
+            "ort": t.get("ort", ""), "land": t.get("land", ""),
             "neu": bool(gemeldet and gemeldet >= grenze), "gemeldet": gemeldet,
         })
     daten = {
@@ -578,6 +642,13 @@ button.haupt{background:#1d1d1f;color:#fff;border-color:#1d1d1f} button.haupt:ho
 .feld b{color:#1d1d1f;font-size:14px;font-weight:600}
 .feld input[type=range]{width:190px;accent-color:#ff385c;margin:3px 0 0}
 .filter .ende{margin-left:auto;display:flex;gap:10px}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{padding:6px 12px;border-radius:999px;font-size:13.5px}
+.chip.an{background:#1d1d1f;color:#fff;border-color:#1d1d1f}
+.laender{flex-basis:100%}
+.land{font-size:18px;font-weight:700;margin:28px 0 12px;display:flex;align-items:baseline;gap:10px}
+.land:first-child{margin-top:0}
+.land span{font-size:14px;font-weight:400;color:#6b6760}
 .hinweis{margin:16px 24px 0;padding:12px 16px;border-radius:12px;background:#fff4d6;border:1px solid #ecd9a0;font-size:14px}
 main{padding:20px 24px 48px}
 .raster{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
@@ -603,7 +674,7 @@ main{padding:20px 24px 48px}
 dialog{border:0;border-radius:18px;padding:24px;width:min(420px,calc(100vw - 32px));box-shadow:0 20px 60px rgba(0,0,0,.3);color:inherit}
 dialog::backdrop{background:rgba(0,0,0,.45)}
 dialog h2{margin:0 0 6px;font-size:19px} dialog p{margin:0 0 16px;font-size:14px;color:#6b6760;line-height:1.45}
-dialog .feld{margin-bottom:12px} dialog .feld input{width:100%}
+dialog .feld{margin-bottom:12px} dialog .feld input,dialog .feld select{width:100%}
 dialog .knoepfe{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
 #dialogstatus{font-size:14px;margin-top:10px;min-height:20px}
 @media (max-width:600px){header,main,.filter{padding-left:14px;padding-right:14px}.hinweis{margin-left:14px;margin-right:14px}
@@ -630,28 +701,31 @@ dialog .knoepfe{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
   <label class="feld">Bewertung<select id="f_sterne"><option value="0">egal</option><option value="4.5">ab 4,5</option><option value="4.8">ab 4,8</option><option value="4.9">ab 4,9</option></select></label>
   <div class="ende">
     <button type="button" id="zurueck">Filter zurücksetzen</button>
-    <button type="button" id="suchknopf" class="haupt" hidden>Zeitraum &amp; Personen ändern</button>
+    <button type="button" id="suchknopf" class="haupt" hidden>Suche für alle ändern</button>
   </div>
+  <div class="feld laender" id="laenderfeld" hidden>Länder<div class="chips" id="chips"></div></div>
 </div>
 <div class="hinweis" id="hinweis" hidden></div>
 <main>
-  <div class="raster" id="raster"></div>
+  <div id="bereiche"></div>
   <div class="leer" id="leer">Der erste Durchlauf läuft gerade. Die Unterkünfte erscheinen hier von selbst, du musst nichts neu laden.</div>
 </main>
 <dialog id="dialog">
   <form method="dialog" id="suchform">
-    <h2>Zeitraum &amp; Personen ändern</h2>
-    <p>Das ändert die Suche <b>für alle</b>, die diese Seite nutzen. Die neue Suche startet beim nächsten Durchlauf, die Ergebnisse stehen nach etwa 15 bis 25 Minuten hier.</p>
+    <h2>Suche für alle ändern</h2>
+    <p>Das ändert die Suche <b>für alle</b>, die diese Seite nutzen. Die neue Suche startet beim nächsten Durchlauf, die Ergebnisse stehen nach etwa 15 bis 30 Minuten hier. Preis und Fahrzeit kann danach jeder oben für sich enger stellen.</p>
     <label class="feld">Anreise<input type="date" id="s_ein" required></label>
     <label class="feld">Abreise<input type="date" id="s_aus" required></label>
     <label class="feld">Personen<input type="number" id="s_gaeste" min="1" max="16" required></label>
+    <label class="feld">Umkreis: Fahrzeit ab Startort bis<select id="s_fahrt"><option value="3">3 Stunden</option><option value="4">4 Stunden</option><option value="5">5 Stunden</option><option value="6">6 Stunden</option><option value="7">7 Stunden</option><option value="8">8 Stunden</option></select></label>
+    <label class="feld">Gesamtpreis bis<select id="s_preis"><option value="1000">1.000 €</option><option value="1500">1.500 €</option><option value="2000">2.000 €</option><option value="2500">2.500 €</option><option value="3000">3.000 €</option><option value="4000">4.000 €</option></select></label>
     <div id="dialogstatus"></div>
     <div class="knoepfe"><button type="button" id="abbrechen">Abbrechen</button><button type="submit" class="haupt">Für alle speichern</button></div>
   </form>
 </dialog>
 <script>
 var daten = null, karten = {}, ersterAufbau = true, filterBereit = false;
-var raster = document.getElementById('raster'), auswahl = document.getElementById('sortierung');
+var bereiche = document.getElementById('bereiche'), auswahl = document.getElementById('sortierung');
 function $(id) { return document.getElementById(id); }
 function merken(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 function holen(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
@@ -665,17 +739,18 @@ function stunden(h) { return (h % 1 ? Math.floor(h) + ',5' : h) + ' h'; }
 function datum(iso) { var t = iso.split('-'); return t[2] + '.' + t[1] + '.' + t[0]; }
 
 /* ---------- Filter (gelten nur für dich) ---------- */
-var F = { preis: 0, fahrt: 0, zimmer: 0, betten: 0, baeder: 0, sterne: 0 };
-function filterStandard() { return { preis: Math.min(daten.standard_preis, daten.grenze_preis), fahrt: daten.grenze_fahrzeit, zimmer: 0, betten: 0, baeder: 0, sterne: 0 }; }
+var F = { preis: 0, fahrt: 0, zimmer: 0, betten: 0, baeder: 0, sterne: 0, laender: [] };
+function filterStandard() { return { preis: Math.min(daten.standard_preis, daten.grenze_preis), fahrt: daten.grenze_fahrzeit, zimmer: 0, betten: 0, baeder: 0, sterne: 0, laender: [] }; }
+function landVon(d) { return d.land || 'Land noch unbekannt'; }
 function filterEinrichten() {
   var p = $('f_preis'), f = $('f_fahrt');
   p.max = daten.grenze_preis; f.max = daten.grenze_fahrzeit;
   if (!filterBereit) {
     var g = holen('filter'), s = filterStandard();
-    F = g && typeof g === 'object' ? { preis: +g.preis || s.preis, fahrt: +g.fahrt || s.fahrt, zimmer: +g.zimmer || 0, betten: +g.betten || 0, baeder: +g.baeder || 0, sterne: +g.sterne || 0 } : s;
+    F = g && typeof g === 'object' ? { preis: +g.preis || s.preis, fahrt: +g.fahrt || s.fahrt, zimmer: +g.zimmer || 0, betten: +g.betten || 0, baeder: +g.baeder || 0, sterne: +g.sterne || 0, laender: Array.isArray(g.laender) ? g.laender.map(String) : [] } : s;
     ['f_preis', 'f_fahrt', 'f_zimmer', 'f_betten', 'f_baeder', 'f_sterne'].forEach(function (id) {
       $(id).oninput = $(id).onchange = function () {
-        F = { preis: +p.value, fahrt: +f.value, zimmer: +$('f_zimmer').value, betten: +$('f_betten').value, baeder: +$('f_baeder').value, sterne: +$('f_sterne').value };
+        F = { preis: +p.value, fahrt: +f.value, zimmer: +$('f_zimmer').value, betten: +$('f_betten').value, baeder: +$('f_baeder').value, sterne: +$('f_sterne').value, laender: F.laender };
         merken('filter', F); filterZeigen(); zeichnen(false);
       };
     });
@@ -691,7 +766,33 @@ function filterZeigen() {
   $('preiswert').textContent = euro(F.preis) + '  ·  ' + euro(F.preis / daten.gaeste) + ' p. P.';
   $('fahrtwert').textContent = stunden(F.fahrt);
 }
-function passt(d) {
+function chipsZeigen() {
+  var zahl = {}, box = $('chips');
+  daten.eintraege.forEach(function (d) { if (passt(d, true)) zahl[landVon(d)] = (zahl[landVon(d)] || 0) + 1; });
+  daten.eintraege.forEach(function (d) { if (!(landVon(d) in zahl)) zahl[landVon(d)] = 0; });
+  var namen = Object.keys(zahl).sort(landReihenfolge(zahl));
+  F.laender = F.laender.filter(function (l) { return l in zahl; });
+  box.textContent = '';
+  namen.forEach(function (name) {
+    var c = el('button', 'chip' + (F.laender.indexOf(name) >= 0 ? ' an' : ''), name + ' · ' + zahl[name]); c.type = 'button';
+    c.onclick = function () {
+      var i = F.laender.indexOf(name); if (i >= 0) F.laender.splice(i, 1); else F.laender.push(name);
+      merken('filter', F); zeichnen(false);
+    };
+    box.appendChild(c);
+  });
+  $('laenderfeld').hidden = namen.length < 2;
+}
+function landReihenfolge(zahl) {
+  return function (x, y) {
+    var ux = x === 'Land noch unbekannt', uy = y === 'Land noch unbekannt';
+    if (ux !== uy) return ux ? 1 : -1;
+    if ((x === 'Deutschland') !== (y === 'Deutschland')) return x === 'Deutschland' ? -1 : 1;
+    return zahl[y] - zahl[x] || x.localeCompare(y);
+  };
+}
+function passt(d, ohneLand) {
+  if (!ohneLand && F.laender.length && F.laender.indexOf(landVon(d)) < 0) return false;
   return (!d.preis || d.preis <= F.preis) && d.fahrzeit <= F.fahrt * 60 && d.schlafzimmer >= F.zimmer &&
     d.betten >= F.betten && d.baeder >= F.baeder && (!F.sterne || zahl(d.bewertung) >= F.sterne);
 }
@@ -724,33 +825,43 @@ function karteFuellen(a, d) {
   if (erstes && a._bild.getAttribute('src') !== erstes) a._bild.src = erstes;
   a._neu.style.display = d.neu ? '' : 'none';
   a._stern.textContent = d.bewertung ? '★ ' + d.bewertung : ''; a._stern.style.display = d.bewertung ? '' : 'none';
-  a._name.textContent = d.name; a._details.textContent = d.details;
+  a._name.textContent = d.name; a._details.textContent = (d.ort ? d.ort + '  ·  ' : '') + d.details;
   a._preis.textContent = ''; a._preis.appendChild(el('b', null, d.preis_text));
   if (d.pro_kopf) a._preis.appendChild(document.createTextNode('  ·  ' + d.pro_kopf + ' € p. P.'));
   a._fahrt.textContent = '🚗 ' + d.fahrzeit_text;
 }
 function zeichnen(markieren) {
   if (!daten) return;
-  var alle = daten.eintraege, liste = alle.filter(passt), art = auswahl.value;
+  var alle = daten.eintraege, liste = alle.filter(function (d) { return passt(d); }), art = auswahl.value;
   liste.sort(function (x, y) {
     if (art === 'preis') return (x.preis || 1e9) - (y.preis || 1e9) || x.fahrzeit - y.fahrzeit;
     if (art === 'bewertung') return zahl(y.bewertung) - zahl(x.bewertung) || x.fahrzeit - y.fahrzeit;
     if (art === 'neu') return (y.neu - x.neu) || (y.gemeldet > x.gemeldet ? 1 : y.gemeldet < x.gemeldet ? -1 : 0) || x.fahrzeit - y.fahrzeit;
     return x.fahrzeit - y.fahrzeit;
   });
-  var da = {}, sichtbar = {};
+  var da = {}, sichtbar = {}, gruppen = {}, zahl = {};
   alle.forEach(function (d) { da[d.id] = 1; });
   liste.forEach(function (d) {
     var k = karten[d.id], frisch = !k;
     if (!k) k = karten[d.id] = karteBauen();
     karteFuellen(k, d); sichtbar[d.id] = 1;
     if (frisch && markieren && !ersterAufbau) k.classList.add('frisch');
-    raster.appendChild(k);
+    (gruppen[landVon(d)] = gruppen[landVon(d)] || []).push(k); zahl[landVon(d)] = gruppen[landVon(d)].length;
   });
   Object.keys(karten).forEach(function (id) {
     if (!sichtbar[id]) karten[id].remove();
     if (!da[id]) delete karten[id];
   });
+  var neuBereiche = document.createDocumentFragment(), laender = Object.keys(gruppen).sort(landReihenfolge(zahl));
+  laender.forEach(function (name) {
+    if (laender.length > 1 || name !== 'Land noch unbekannt') {
+      var h = el('h2', 'land', name); h.appendChild(el('span', null, gruppen[name].length + (gruppen[name].length === 1 ? ' Unterkunft' : ' Unterkünfte')));
+      neuBereiche.appendChild(h);
+    }
+    var r = el('div', 'raster'); gruppen[name].forEach(function (k) { r.appendChild(k); }); neuBereiche.appendChild(r);
+  });
+  bereiche.textContent = ''; bereiche.appendChild(neuBereiche);
+  chipsZeigen();
   var n = liste.length, neu = liste.filter(function (d) { return d.neu; }).length;
   $('titel').textContent = (n < alle.length ? n + ' von ' + alle.length + ' Unterkünften frei' : n + (n === 1 ? ' Unterkunft frei' : ' Unterkünfte frei')) + (neu ? '  ·  ' + neu + ' neu' : '');
   document.title = (neu ? '(' + neu + ' neu) ' : '') + n + ' frei – Airbnb Silvester';
@@ -773,20 +884,24 @@ function standZeigen() {
 /* ---------- Suche für alle ändern ---------- */
 function hinweisZeigen() {
   var w = holen('wunsch'), h = $('hinweis');
-  if (w && daten && (w.checkin !== daten.checkin || w.checkout !== daten.checkout || w.gaeste !== daten.gaeste) && Date.now() - w.zeit < 90 * 60000) {
-    h.textContent = 'Neue Suche ist angefragt: ' + w.gaeste + ' Personen, ' + datum(w.checkin) + ' bis ' + datum(w.checkout) + '. Sie wird beim nächsten Durchlauf eingerichtet, die Ergebnisse erscheinen dann von selbst.';
+  if (w && daten && (w.checkin !== daten.checkin || w.checkout !== daten.checkout || w.gaeste !== daten.gaeste || w.fahrzeit !== daten.grenze_fahrzeit || w.preis !== daten.grenze_preis) && Date.now() - w.zeit < 90 * 60000) {
+    h.textContent = 'Neue Suche ist angefragt: ' + w.gaeste + ' Personen, ' + datum(w.checkin) + ' bis ' + datum(w.checkout) + ', bis ' + stunden(w.fahrzeit) + ' Fahrt und ' + euro(w.preis) + '. Sie wird beim nächsten Durchlauf eingerichtet, die Ergebnisse erscheinen dann von selbst.';
     h.hidden = false;
   } else { h.hidden = true; }
 }
 $('suchknopf').onclick = function () {
   $('s_ein').value = daten.checkin; $('s_aus').value = daten.checkout; $('s_gaeste').value = daten.gaeste;
+  [['s_fahrt', daten.grenze_fahrzeit, stunden(daten.grenze_fahrzeit)], ['s_preis', daten.grenze_preis, euro(daten.grenze_preis)]].forEach(function (x) {
+    var sel = $(x[0]); if (![].some.call(sel.options, function (o) { return +o.value === +x[1]; })) { var o = el('option', null, x[2]); o.value = x[1]; sel.appendChild(o); }
+    sel.value = x[1];
+  });
   $('dialogstatus').textContent = ''; $('dialog').showModal();
 };
 $('abbrechen').onclick = function () { $('dialog').close(); };
 $('suchform').oninput = function () { $('dialogstatus').textContent = ''; };
 $('suchform').onsubmit = function (ev) {
   ev.preventDefault();
-  var w = { checkin: $('s_ein').value, checkout: $('s_aus').value, gaeste: parseInt($('s_gaeste').value, 10) }, st = $('dialogstatus');
+  var w = { checkin: $('s_ein').value, checkout: $('s_aus').value, gaeste: parseInt($('s_gaeste').value, 10), fahrzeit: +$('s_fahrt').value, preis: +$('s_preis').value }, st = $('dialogstatus');
   var naechte = (new Date(w.checkout) - new Date(w.checkin)) / 86400000;
   if (!(naechte >= 1 && naechte <= 21)) { st.textContent = 'Die Abreise muss 1 bis 21 Nächte nach der Anreise liegen.'; return; }
   if (!(w.gaeste >= 1 && w.gaeste <= 16)) { st.textContent = 'Bitte 1 bis 16 Personen angeben.'; return; }
@@ -802,7 +917,7 @@ window.aktualisiere = function (d) {
   d.gaeste = d.gaeste || 8; d.grenze_fahrzeit = d.grenze_fahrzeit || 6;
   d.grenze_preis = d.grenze_preis || Math.max.apply(null, d.eintraege.map(function (x) { return x.preis || 0; }).concat([1000]));
   d.standard_preis = d.standard_preis || d.grenze_preis;
-  d.eintraege.forEach(function (x) { x.schlafzimmer = x.schlafzimmer || 0; x.betten = x.betten || 0; x.baeder = x.baeder || 0; });
+  d.eintraege.forEach(function (x) { x.schlafzimmer = x.schlafzimmer || 0; x.betten = x.betten || 0; x.baeder = x.baeder || 0; x.land = x.land || ''; x.ort = x.ort || ''; });
   daten = d; filterEinrichten(); $('suchknopf').hidden = !d.kanal;
   zeichnen(true); standZeigen();
 };
@@ -838,7 +953,8 @@ def push(state, titel, text, link=None):
 def melden(state, meldungen):
     meldungen.sort(key=lambda m: m[1]["fahrzeit"])
     for art, t in meldungen:
-        zeile = (f"{art}: {t['name']} | {t['preis_text']} | {t['bewertung']} Sterne | "
+        wo = ", ".join(x for x in (t.get("ort"), t.get("land")) if x)
+        zeile = (f"{art}: {t['name']} | {wo} | {t['preis_text']} | {t['bewertung']} Sterne | "
                  f"{t['fahrzeit_text']} Fahrt | {t['details']} | {t['url']}")
         log("  >>> " + zeile)
         with LOG_DATEI.open("a", encoding="utf-8") as f:
@@ -849,7 +965,8 @@ def melden(state, meldungen):
         push(
             state,
             f"{art}: {t['name']}"[:120],
-            f"{t['preis_text']} gesamt, {t['bewertung']} Sterne, {t['fahrzeit_text']} Fahrt\n{t['details']}",
+            (", ".join(x for x in (t.get("ort"), t.get("land")) if x) + "\n"
+             f"{t['preis_text']} gesamt, {t['bewertung']} Sterne, {t['fahrzeit_text']} Fahrt\n{t['details']}").strip(),
             t["url"],
         )
     rest = len(meldungen) - MAX_PUSH_PRO_LAUF
