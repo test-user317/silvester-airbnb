@@ -26,6 +26,8 @@ jobs:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: main
 
       - name: Airbnb abfragen
         id: abfrage
