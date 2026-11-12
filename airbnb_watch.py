@@ -53,7 +53,8 @@ GAESTE = 8
 NUR_GAESTE_FAVORIT = True
 NUR_GANZE_UNTERKUNFT = True     # keine Einzelzimmer / Hotelzimmer
 MIN_SCHLAFZIMMER = 0            # 0 = egal
-MAX_GESAMTPREIS = 1400          # in Euro fuer alle zusammen und den ganzen Aufenthalt, 0 = egal
+MAX_GESAMTPREIS = 1400          # Euro fuer alle zusammen: Voreinstellung auf der Seite und Grenze fuer Pushes
+SAMMEL_MAX_PREIS = 2000         # bis zu diesem Gesamtpreis wird gesammelt; auf der Seite filtert jeder selbst
 
 INTERVALL_MIN = 15              # Pause zwischen zwei Durchlaeufen
 PUSH_AKTIV = True               # Push aufs Handy ueber die ntfy-App
@@ -67,15 +68,15 @@ STATE_DATEI = ORDNER / "airbnb_watch_state.json"
 CSV_DATEI = ORDNER / "airbnb_aktuell_frei.csv"
 HTML_DATEI = ORDNER / "airbnb_uebersicht.html"
 DATEN_DATEI = ORDNER / "airbnb_daten.js"
+EINSTELL_DATEI = ORDNER / "einstellungen.json"
 LOG_DATEI = ORDNER / "airbnb_treffer.log"
 
 BASIS_URL = "https://www.airbnb.de/s/homes"
 ROUTING_URL = "https://router.project-osrm.org/table/v1/driving/"
 ROUTING_PAKET = 80              # Ziele pro Routing-Anfrage
-NAECHTE = (datetime.strptime(CHECKOUT, "%Y-%m-%d") - datetime.strptime(CHECKIN, "%Y-%m-%d")).days
-PROFIL = "|".join(str(x) for x in (
-    ZENTRUM_LAT, ZENTRUM_LNG, MAX_FAHRZEIT_STD, RADIUS_KM, CHECKIN, CHECKOUT, GAESTE,
-    NUR_GAESTE_FAVORIT, NUR_GANZE_UNTERKUNFT, MIN_SCHLAFZIMMER, MAX_GESAMTPREIS))
+NAECHTE = 0
+PROFIL = ""
+KANAL = ""                      # ntfy-Thema, ueber das die Seite Aenderungen an der Suche schickt
 MAX_SEITEN = 15                 # Airbnb zeigt pro Suche hoechstens 15 Seiten
 MIN_KACHEL_GRAD = 0.05
 FEHLT_SCHWELLE = 2              # so oft muss ein Inserat fehlen, bevor "wieder frei" gilt
@@ -90,6 +91,72 @@ STATE_RE = re.compile(
 
 class AbrufFehler(Exception):
     pass
+
+
+def profil_berechnen():
+    """Leitet Naechte und Suchprofil aus den aktuellen Einstellungen ab."""
+    global NAECHTE, PROFIL
+    NAECHTE = (datetime.strptime(CHECKOUT, "%Y-%m-%d") - datetime.strptime(CHECKIN, "%Y-%m-%d")).days
+    PROFIL = "|".join(str(x) for x in (
+        ZENTRUM_LAT, ZENTRUM_LNG, MAX_FAHRZEIT_STD, RADIUS_KM, CHECKIN, CHECKOUT, GAESTE,
+        NUR_GAESTE_FAVORIT, NUR_GANZE_UNTERKUNFT, MIN_SCHLAFZIMMER, SAMMEL_MAX_PREIS))
+
+
+profil_berechnen()
+
+
+def suche_pruefen(d):
+    """Prueft eine von der Seite geschickte Suche. Gibt (checkin, checkout, gaeste) oder None zurueck."""
+    try:
+        ein, aus, gaeste = str(d["checkin"]), str(d["checkout"]), int(d["gaeste"])
+        if not (re.fullmatch(r"\d{4}-\d{2}-\d{2}", ein) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", aus)):
+            return None
+        t1, t2 = datetime.strptime(ein, "%Y-%m-%d"), datetime.strptime(aus, "%Y-%m-%d")
+        heute = datetime.now()
+        if not (1 <= (t2 - t1).days <= 21 and t1 >= heute - timedelta(days=1)
+                and t2 <= heute + timedelta(days=730) and 1 <= gaeste <= 16):
+            return None
+        return ein, aus, gaeste
+    except Exception:
+        return None
+
+
+def einstellungen_laden():
+    """Liest einstellungen.json und holt neue Aenderungen ab, die jemand auf der Seite gespeichert hat."""
+    global CHECKIN, CHECKOUT, GAESTE, KANAL
+    if not EINSTELL_DATEI.exists():
+        return
+    try:
+        e = json.loads(EINSTELL_DATEI.read_text(encoding="utf-8"))
+    except ValueError:
+        return
+    KANAL = str(e.get("kanal") or "")
+    if KANAL and re.fullmatch(r"[A-Za-z0-9_-]{8,64}", KANAL):
+        try:
+            neueste = None
+            for zeile in http_get(f"https://ntfy.sh/{KANAL}/json?poll=1&since=12h").splitlines():
+                try:
+                    m = json.loads(zeile)
+                    if m.get("event") != "message" or m.get("time", 0) <= e.get("geaendert", 0):
+                        continue
+                    suche = suche_pruefen(json.loads(m.get("message") or ""))
+                except Exception:
+                    continue
+                if suche and (neueste is None or m["time"] > neueste[0]):
+                    neueste = (m["time"], suche)
+            if neueste:
+                e.update(geaendert=neueste[0], checkin=neueste[1][0], checkout=neueste[1][1], gaeste=neueste[1][2])
+                with open(EINSTELL_DATEI, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps(e, indent=1) + "\n")
+                log(f"Suche wurde auf der Seite geaendert: {neueste[1][2]} Gaeste, {neueste[1][0]} bis {neueste[1][1]}")
+        except Exception as fehler:
+            log(f"Aenderungen von der Seite nicht abrufbar ({type(fehler).__name__})")
+    else:
+        KANAL = ""
+    suche = suche_pruefen(e) if "checkin" in e else None
+    if suche:
+        CHECKIN, CHECKOUT, GAESTE = suche
+    profil_berechnen()
 
 
 def jetzt():
@@ -151,9 +218,9 @@ def such_url(k, cursor=None):
         p.append(("room_types[]", "Entire home/apt"))
     if MIN_SCHLAFZIMMER:
         p.append(("min_bedrooms", str(MIN_SCHLAFZIMMER)))
-    if MAX_GESAMTPREIS:
+    if SAMMEL_MAX_PREIS:
         # input_type 2 = Gesamtpreis fuer den ganzen Aufenthalt
-        p.append(("price_max", str(MAX_GESAMTPREIS)))
+        p.append(("price_max", str(SAMMEL_MAX_PREIS)))
         p.append(("price_filter_input_type", "2"))
         p.append(("price_filter_num_nights", str(NAECHTE)))
     if cursor:
@@ -267,6 +334,13 @@ def treffer_lesen(t):
             if details:
                 break
 
+        def anzahl(muster):
+            for teil in details:
+                m = re.search(r"(\d+(?:,\d)?)\s*(?:" + muster + ")", teil)
+                if m:
+                    return float(m.group(1).replace(",", "."))
+            return 0
+
         bilder = []
         for b in t.get("contextualPictures") or []:
             adresse = (b or {}).get("picture")
@@ -284,6 +358,7 @@ def treffer_lesen(t):
             "preis": preis_als_zahl(preis_text),
             "bewertung": t.get("avgRatingLocalized") or "",
             "details": ", ".join(details[:3]),
+            "betten": anzahl("Bett"), "schlafzimmer": anzahl("Schlafzimmer"), "baeder": anzahl("Bad|Bäder"),
             "url": (f"https://www.airbnb.de/rooms/{lid}"
                     f"?check_in={CHECKIN}&check_out={CHECKOUT}&adults={GAESTE}"),
         }
@@ -364,7 +439,7 @@ def durchlauf(state):
     for lid, t in gefunden.items():
         if t["km"] > RADIUS_KM:
             continue
-        if MAX_GESAMTPREIS and t["preis"] and t["preis"] > MAX_GESAMTPREIS:
+        if SAMMEL_MAX_PREIS and t["preis"] and t["preis"] > SAMMEL_MAX_PREIS:
             continue
         passend[lid] = t
     fahrzeiten_ergaenzen(state, passend)
@@ -454,15 +529,18 @@ def daten_schreiben(state, aktuell):
             "pro_kopf": round(t["preis"] / GAESTE) if t["preis"] else 0,
             "bewertung": t["bewertung"], "fahrzeit": t["fahrzeit"],
             "fahrzeit_text": t["fahrzeit_text"], "details": t["details"],
+            "betten": t.get("betten", 0), "schlafzimmer": t.get("schlafzimmer", 0), "baeder": t.get("baeder", 0),
             "neu": bool(gemeldet and gemeldet >= grenze), "gemeldet": gemeldet,
         })
     daten = {
         "stand": int(time.time()),
         "intervall_min": INTERVALL_MIN,
         "suche": (f"{GAESTE} Personen · {datetime.strptime(CHECKIN, '%Y-%m-%d'):%d.%m.} bis "
-                  f"{datetime.strptime(CHECKOUT, '%Y-%m-%d'):%d.%m.%Y} · "
-                  + (f"max. {MAX_GESAMTPREIS} € gesamt · " if MAX_GESAMTPREIS else "")
-                  + f"max. {MAX_FAHRZEIT_STD:g} h ab {ZENTRUM_NAME}"),
+                  f"{datetime.strptime(CHECKOUT, '%Y-%m-%d'):%d.%m.%Y} · {NAECHTE} Nächte · "
+                  f"Gäste-Favoriten · Fahrzeit ab {ZENTRUM_NAME}"),
+        "checkin": CHECKIN, "checkout": CHECKOUT, "gaeste": GAESTE, "kanal": KANAL,
+        "grenze_preis": SAMMEL_MAX_PREIS, "grenze_fahrzeit": MAX_FAHRZEIT_STD,
+        "standard_preis": MAX_GESAMTPREIS or SAMMEL_MAX_PREIS,
         "eintraege": eintraege,
     }
     text = ("window.AIRBNB_DATEN = " + json.dumps(daten, ensure_ascii=False)
@@ -483,7 +561,7 @@ SEITE = r"""<!DOCTYPE html>
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:system-ui,"Segoe UI",Roboto,sans-serif;background:#f4f2ee;color:#1d1d1f}
-header{position:sticky;top:0;z-index:5;background:rgba(244,242,238,.92);backdrop-filter:blur(8px);
+header{position:sticky;top:0;z-index:5;background:rgba(244,242,238,.94);backdrop-filter:blur(8px);
   border-bottom:1px solid #e2ded6;padding:14px 24px;display:flex;flex-wrap:wrap;gap:8px 24px;align-items:center}
 h1{font-size:20px;margin:0;font-weight:700}
 .suche{font-size:13px;color:#6b6760;margin-top:2px}
@@ -492,7 +570,15 @@ h1{font-size:20px;margin:0;font-weight:700}
 .punkt{width:9px;height:9px;border-radius:50%;background:#2fa66a;box-shadow:0 0 0 0 rgba(47,166,106,.6);animation:puls 2s infinite}
 .alt .punkt{background:#d98b1f;animation:none}
 @keyframes puls{70%{box-shadow:0 0 0 8px rgba(47,166,106,0)}100%{box-shadow:0 0 0 0 rgba(47,166,106,0)}}
-select{font:inherit;font-size:14px;padding:7px 10px;border-radius:10px;border:1px solid #d5d0c6;background:#fff;color:inherit}
+select,button,input[type=date],input[type=number]{font:inherit;font-size:14px;padding:7px 10px;border-radius:10px;border:1px solid #d5d0c6;background:#fff;color:inherit}
+button{cursor:pointer} button:hover{border-color:#a9a397}
+button.haupt{background:#1d1d1f;color:#fff;border-color:#1d1d1f} button.haupt:hover{background:#000}
+.filter{display:flex;flex-wrap:wrap;gap:14px 26px;align-items:flex-end;padding:14px 24px;background:#fbfaf7;border-bottom:1px solid #e2ded6}
+.feld{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:#6b6760}
+.feld b{color:#1d1d1f;font-size:14px;font-weight:600}
+.feld input[type=range]{width:190px;accent-color:#ff385c;margin:3px 0 0}
+.filter .ende{margin-left:auto;display:flex;gap:10px}
+.hinweis{margin:16px 24px 0;padding:12px 16px;border-radius:12px;background:#fff4d6;border:1px solid #ecd9a0;font-size:14px}
 main{padding:20px 24px 48px}
 .raster{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:16px}
 .kachel{position:relative;display:block;aspect-ratio:1/1;border-radius:18px;overflow:hidden;background:#d9d5cc;
@@ -508,13 +594,20 @@ main{padding:20px 24px 48px}
 .marke{position:absolute;z-index:2;top:12px;padding:5px 10px;border-radius:999px;font-size:12.5px;font-weight:700}
 .stern{right:12px;background:rgba(255,255,255,.94);color:#1d1d1f}
 .neu{left:12px;background:#ff385c;color:#fff}
-.pfeil{position:absolute;z-index:3;top:42%;width:34px;height:34px;border-radius:50%;border:0;background:rgba(255,255,255,.92);
+.pfeil{position:absolute;z-index:3;top:42%;width:34px;height:34px;padding:0;border-radius:50%;border:0;background:rgba(255,255,255,.92);
   color:#1d1d1f;font-size:18px;line-height:1;cursor:pointer;opacity:0;transition:opacity .15s}
 .kachel:hover .pfeil{opacity:1} .pfeil.l{left:10px} .pfeil.r{right:10px}
 .frisch{animation:blink 1.6s ease-out 2}
 @keyframes blink{0%{box-shadow:0 0 0 0 rgba(255,56,92,.9)}100%{box-shadow:0 0 0 18px rgba(255,56,92,0)}}
 .leer{padding:80px 20px;text-align:center;color:#6b6760;font-size:16px}
-@media (max-width:600px){header,main{padding-left:14px;padding-right:14px}.raster{grid-template-columns:1fr;gap:14px}.pfeil{opacity:.9;top:34%}}
+dialog{border:0;border-radius:18px;padding:24px;width:min(420px,calc(100vw - 32px));box-shadow:0 20px 60px rgba(0,0,0,.3);color:inherit}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog h2{margin:0 0 6px;font-size:19px} dialog p{margin:0 0 16px;font-size:14px;color:#6b6760;line-height:1.45}
+dialog .feld{margin-bottom:12px} dialog .feld input{width:100%}
+dialog .knoepfe{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+#dialogstatus{font-size:14px;margin-top:10px;min-height:20px}
+@media (max-width:600px){header,main,.filter{padding-left:14px;padding-right:14px}.hinweis{margin-left:14px;margin-right:14px}
+  .raster{grid-template-columns:1fr;gap:14px}.pfeil{opacity:.9;top:34%}.feld{flex:1 1 44%}.feld input[type=range]{width:100%}.filter .ende{margin-left:0;width:100%}}
 </style></head><body>
 <header>
   <div><h1 id="titel">Unterkünfte werden geladen …</h1><div class="suche" id="suche"></div></div>
@@ -528,21 +621,83 @@ main{padding:20px 24px 48px}
     </select>
   </div>
 </header>
+<div class="filter" id="filter" hidden>
+  <label class="feld">Max. Gesamtpreis<b id="preiswert"></b><input type="range" id="f_preis" min="400" step="50"></label>
+  <label class="feld">Max. Fahrzeit<b id="fahrtwert"></b><input type="range" id="f_fahrt" min="1" step="0.5"></label>
+  <label class="feld">Schlafzimmer<select id="f_zimmer"><option value="0">egal</option><option value="2">ab 2</option><option value="3">ab 3</option><option value="4">ab 4</option><option value="5">ab 5</option><option value="6">ab 6</option></select></label>
+  <label class="feld">Betten<select id="f_betten"><option value="0">egal</option><option value="4">ab 4</option><option value="6">ab 6</option><option value="8">ab 8</option><option value="10">ab 10</option></select></label>
+  <label class="feld">Bäder<select id="f_baeder"><option value="0">egal</option><option value="2">ab 2</option><option value="3">ab 3</option></select></label>
+  <label class="feld">Bewertung<select id="f_sterne"><option value="0">egal</option><option value="4.5">ab 4,5</option><option value="4.8">ab 4,8</option><option value="4.9">ab 4,9</option></select></label>
+  <div class="ende">
+    <button type="button" id="zurueck">Filter zurücksetzen</button>
+    <button type="button" id="suchknopf" class="haupt" hidden>Zeitraum &amp; Personen ändern</button>
+  </div>
+</div>
+<div class="hinweis" id="hinweis" hidden></div>
 <main>
   <div class="raster" id="raster"></div>
   <div class="leer" id="leer">Der erste Durchlauf läuft gerade. Die Unterkünfte erscheinen hier von selbst, du musst nichts neu laden.</div>
 </main>
+<dialog id="dialog">
+  <form method="dialog" id="suchform">
+    <h2>Zeitraum &amp; Personen ändern</h2>
+    <p>Das ändert die Suche <b>für alle</b>, die diese Seite nutzen. Die neue Suche startet beim nächsten Durchlauf, die Ergebnisse stehen nach etwa 15 bis 25 Minuten hier.</p>
+    <label class="feld">Anreise<input type="date" id="s_ein" required></label>
+    <label class="feld">Abreise<input type="date" id="s_aus" required></label>
+    <label class="feld">Personen<input type="number" id="s_gaeste" min="1" max="16" required></label>
+    <div id="dialogstatus"></div>
+    <div class="knoepfe"><button type="button" id="abbrechen">Abbrechen</button><button type="submit" class="haupt">Für alle speichern</button></div>
+  </form>
+</dialog>
 <script>
-var daten = null, karten = {}, ersterAufbau = true;
+var daten = null, karten = {}, ersterAufbau = true, filterBereit = false;
 var raster = document.getElementById('raster'), auswahl = document.getElementById('sortierung');
-try { auswahl.value = localStorage.getItem('sortierung') || 'neu'; } catch (e) {}
-if (!auswahl.value) auswahl.value = 'neu';
-auswahl.onchange = function () { try { localStorage.setItem('sortierung', auswahl.value); } catch (e) {} zeichnen(false); };
+function $(id) { return document.getElementById(id); }
+function merken(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function holen(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } }
+auswahl.value = holen('sortierung') || 'neu'; if (!auswahl.value) auswahl.value = 'neu';
+auswahl.onchange = function () { merken('sortierung', auswahl.value); zeichnen(false); };
 
 function el(tag, klasse, text) { var e = document.createElement(tag); if (klasse) e.className = klasse; if (text != null) e.textContent = text; return e; }
 function zahl(t) { return parseFloat(String(t || '0').replace(',', '.')) || 0; }
+function euro(n) { return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.') + ' €'; }
+function stunden(h) { return (h % 1 ? Math.floor(h) + ',5' : h) + ' h'; }
+function datum(iso) { var t = iso.split('-'); return t[2] + '.' + t[1] + '.' + t[0]; }
 
-function karteBauen(d) {
+/* ---------- Filter (gelten nur für dich) ---------- */
+var F = { preis: 0, fahrt: 0, zimmer: 0, betten: 0, baeder: 0, sterne: 0 };
+function filterStandard() { return { preis: Math.min(daten.standard_preis, daten.grenze_preis), fahrt: daten.grenze_fahrzeit, zimmer: 0, betten: 0, baeder: 0, sterne: 0 }; }
+function filterEinrichten() {
+  var p = $('f_preis'), f = $('f_fahrt');
+  p.max = daten.grenze_preis; f.max = daten.grenze_fahrzeit;
+  if (!filterBereit) {
+    var g = holen('filter'), s = filterStandard();
+    F = g && typeof g === 'object' ? { preis: +g.preis || s.preis, fahrt: +g.fahrt || s.fahrt, zimmer: +g.zimmer || 0, betten: +g.betten || 0, baeder: +g.baeder || 0, sterne: +g.sterne || 0 } : s;
+    ['f_preis', 'f_fahrt', 'f_zimmer', 'f_betten', 'f_baeder', 'f_sterne'].forEach(function (id) {
+      $(id).oninput = $(id).onchange = function () {
+        F = { preis: +p.value, fahrt: +f.value, zimmer: +$('f_zimmer').value, betten: +$('f_betten').value, baeder: +$('f_baeder').value, sterne: +$('f_sterne').value };
+        merken('filter', F); filterZeigen(); zeichnen(false);
+      };
+    });
+    $('zurueck').onclick = function () { F = filterStandard(); merken('filter', F); filterZeigen(); zeichnen(false); };
+    $('filter').hidden = false; filterBereit = true;
+  }
+  F.preis = Math.min(F.preis, daten.grenze_preis); F.fahrt = Math.min(F.fahrt, daten.grenze_fahrzeit);
+  filterZeigen();
+}
+function filterZeigen() {
+  $('f_preis').value = F.preis; $('f_fahrt').value = F.fahrt;
+  $('f_zimmer').value = F.zimmer; $('f_betten').value = F.betten; $('f_baeder').value = F.baeder; $('f_sterne').value = F.sterne;
+  $('preiswert').textContent = euro(F.preis) + '  ·  ' + euro(F.preis / daten.gaeste) + ' p. P.';
+  $('fahrtwert').textContent = stunden(F.fahrt);
+}
+function passt(d) {
+  return (!d.preis || d.preis <= F.preis) && d.fahrzeit <= F.fahrt * 60 && d.schlafzimmer >= F.zimmer &&
+    d.betten >= F.betten && d.baeder >= F.baeder && (!F.sterne || zahl(d.bewertung) >= F.sterne);
+}
+
+/* ---------- Kacheln ---------- */
+function karteBauen() {
   var a = el('a', 'kachel'); a.target = '_blank'; a.rel = 'noopener';
   var bild = el('img'); bild.loading = 'lazy'; bild.referrerPolicy = 'no-referrer'; bild.alt = '';
   a.appendChild(bild); a._bild = bild; a._nr = 0;
@@ -563,7 +718,6 @@ function karteBauen(d) {
   t.appendChild(a._name); t.appendChild(a._details); t.appendChild(z); a.appendChild(t);
   return a;
 }
-
 function karteFuellen(a, d) {
   a._daten = d; a.href = d.url;
   var erstes = d.bilder.length ? d.bilder[Math.min(a._nr, d.bilder.length - 1)] + '?im_w=720' : '';
@@ -575,49 +729,83 @@ function karteFuellen(a, d) {
   if (d.pro_kopf) a._preis.appendChild(document.createTextNode('  ·  ' + d.pro_kopf + ' € p. P.'));
   a._fahrt.textContent = '🚗 ' + d.fahrzeit_text;
 }
-
 function zeichnen(markieren) {
   if (!daten) return;
-  var liste = daten.eintraege.slice(), art = auswahl.value;
+  var alle = daten.eintraege, liste = alle.filter(passt), art = auswahl.value;
   liste.sort(function (x, y) {
     if (art === 'preis') return (x.preis || 1e9) - (y.preis || 1e9) || x.fahrzeit - y.fahrzeit;
     if (art === 'bewertung') return zahl(y.bewertung) - zahl(x.bewertung) || x.fahrzeit - y.fahrzeit;
     if (art === 'neu') return (y.neu - x.neu) || (y.gemeldet > x.gemeldet ? 1 : y.gemeldet < x.gemeldet ? -1 : 0) || x.fahrzeit - y.fahrzeit;
     return x.fahrzeit - y.fahrzeit;
   });
-  var da = {};
+  var da = {}, sichtbar = {};
+  alle.forEach(function (d) { da[d.id] = 1; });
   liste.forEach(function (d) {
     var k = karten[d.id], frisch = !k;
-    if (!k) k = karten[d.id] = karteBauen(d);
-    karteFuellen(k, d); da[d.id] = 1;
+    if (!k) k = karten[d.id] = karteBauen();
+    karteFuellen(k, d); sichtbar[d.id] = 1;
     if (frisch && markieren && !ersterAufbau) k.classList.add('frisch');
     raster.appendChild(k);
   });
-  Object.keys(karten).forEach(function (id) { if (!da[id]) { karten[id].remove(); delete karten[id]; } });
+  Object.keys(karten).forEach(function (id) {
+    if (!sichtbar[id]) karten[id].remove();
+    if (!da[id]) delete karten[id];
+  });
   var n = liste.length, neu = liste.filter(function (d) { return d.neu; }).length;
-  document.getElementById('titel').textContent = n + (n === 1 ? ' Unterkunft frei' : ' Unterkünfte frei') + (neu ? '  ·  ' + neu + ' neu' : '');
+  $('titel').textContent = (n < alle.length ? n + ' von ' + alle.length + ' Unterkünften frei' : n + (n === 1 ? ' Unterkunft frei' : ' Unterkünfte frei')) + (neu ? '  ·  ' + neu + ' neu' : '');
   document.title = (neu ? '(' + neu + ' neu) ' : '') + n + ' frei – Airbnb Silvester';
-  document.getElementById('suche').textContent = daten.suche;
-  document.getElementById('leer').style.display = n ? 'none' : '';
-  if (!n) document.getElementById('leer').textContent = 'Gerade ist nichts Passendes frei. Die Seite aktualisiert sich von selbst.';
+  $('suche').textContent = daten.suche;
+  $('leer').style.display = n ? 'none' : '';
+  if (!n) $('leer').textContent = alle.length ? 'Mit deinen Filtern passt gerade nichts. Stell Preis oder Fahrzeit etwas höher.' : 'Gerade ist nichts Passendes frei. Die Seite aktualisiert sich von selbst.';
   ersterAufbau = false;
 }
-
 function standZeigen() {
   if (!daten) return;
   var min = Math.max(0, Math.round((Date.now() / 1000 - daten.stand) / 60));
   var alt = min > daten.intervall_min * 3 + 15;
-  document.getElementById('live').className = 'live' + (alt ? ' alt' : '');
-  document.getElementById('stand').textContent = alt
+  $('live').className = 'live' + (alt ? ' alt' : '');
+  $('stand').textContent = alt
     ? 'Stand vor ' + (min >= 120 ? Math.round(min / 60) + ' h' : min + ' min') + ' – läuft der Wächter noch?'
     : 'Live · Stand ' + (min < 1 ? 'gerade eben' : 'vor ' + min + ' min');
+  hinweisZeigen();
 }
+
+/* ---------- Suche für alle ändern ---------- */
+function hinweisZeigen() {
+  var w = holen('wunsch'), h = $('hinweis');
+  if (w && daten && (w.checkin !== daten.checkin || w.checkout !== daten.checkout || w.gaeste !== daten.gaeste) && Date.now() - w.zeit < 90 * 60000) {
+    h.textContent = 'Neue Suche ist angefragt: ' + w.gaeste + ' Personen, ' + datum(w.checkin) + ' bis ' + datum(w.checkout) + '. Sie wird beim nächsten Durchlauf eingerichtet, die Ergebnisse erscheinen dann von selbst.';
+    h.hidden = false;
+  } else { h.hidden = true; }
+}
+$('suchknopf').onclick = function () {
+  $('s_ein').value = daten.checkin; $('s_aus').value = daten.checkout; $('s_gaeste').value = daten.gaeste;
+  $('dialogstatus').textContent = ''; $('dialog').showModal();
+};
+$('abbrechen').onclick = function () { $('dialog').close(); };
+$('suchform').oninput = function () { $('dialogstatus').textContent = ''; };
+$('suchform').onsubmit = function (ev) {
+  ev.preventDefault();
+  var w = { checkin: $('s_ein').value, checkout: $('s_aus').value, gaeste: parseInt($('s_gaeste').value, 10) }, st = $('dialogstatus');
+  var naechte = (new Date(w.checkout) - new Date(w.checkin)) / 86400000;
+  if (!(naechte >= 1 && naechte <= 21)) { st.textContent = 'Die Abreise muss 1 bis 21 Nächte nach der Anreise liegen.'; return; }
+  if (!(w.gaeste >= 1 && w.gaeste <= 16)) { st.textContent = 'Bitte 1 bis 16 Personen angeben.'; return; }
+  st.textContent = 'Wird gespeichert …';
+  fetch('https://ntfy.sh/' + daten.kanal, { method: 'POST', body: JSON.stringify(w) }).then(function (r) {
+    if (!r.ok) throw new Error(r.status);
+    w.zeit = Date.now(); merken('wunsch', w); $('dialog').close(); hinweisZeigen();
+  }).catch(function () { st.textContent = 'Speichern hat nicht geklappt. Bitte gleich noch einmal versuchen.'; });
+};
 
 window.aktualisiere = function (d) {
   if (daten && daten.stand === d.stand) return;
-  daten = d; zeichnen(true); standZeigen();
+  d.gaeste = d.gaeste || 8; d.grenze_fahrzeit = d.grenze_fahrzeit || 6;
+  d.grenze_preis = d.grenze_preis || Math.max.apply(null, d.eintraege.map(function (x) { return x.preis || 0; }).concat([1000]));
+  d.standard_preis = d.standard_preis || d.grenze_preis;
+  d.eintraege.forEach(function (x) { x.schlafzimmer = x.schlafzimmer || 0; x.betten = x.betten || 0; x.baeder = x.baeder || 0; });
+  daten = d; filterEinrichten(); $('suchknopf').hidden = !d.kanal;
+  zeichnen(true); standZeigen();
 };
-
 function nachladen() {
   var s = document.createElement('script');
   s.src = 'airbnb_daten.js?t=' + Date.now();
@@ -655,6 +843,8 @@ def melden(state, meldungen):
         log("  >>> " + zeile)
         with LOG_DATEI.open("a", encoding="utf-8") as f:
             f.write(f"{jetzt()} {zeile}\n")
+    meldungen = [m for m in meldungen
+                 if not (MAX_GESAMTPREIS and m[1]["preis"] and m[1]["preis"] > MAX_GESAMTPREIS)]
     for art, t in meldungen[:MAX_PUSH_PRO_LAUF]:
         push(
             state,
@@ -731,7 +921,10 @@ def cloud_dateien_schreiben():
     for datei, text in ((ziel / "watch.yml", WORKFLOW), (ORDNER / ".gitignore", "*.tmp\n__pycache__/\n")):
         with open(datei, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-    log("Angelegt: .github/workflows/watch.yml und .gitignore")
+    if not EINSTELL_DATEI.exists():
+        with open(EINSTELL_DATEI, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps({"kanal": "airbnb-suche-" + secrets.token_hex(8)}, indent=1) + "\n")
+    log("Angelegt: .github/workflows/watch.yml, .gitignore und einstellungen.json")
 
 
 # ------------------------------- Hauptprogramm -----------------------------
@@ -798,10 +991,11 @@ def main():
         log(f"Uebersicht im Browser geoeffnet ({HTML_DATEI.name})")
         return
 
+    einstellungen_laden()
     state = state_laden()
     state_speichern(state)
 
-    preis = f", max. {MAX_GESAMTPREIS} Euro gesamt" if MAX_GESAMTPREIS else ""
+    preis = f", bis {SAMMEL_MAX_PREIS} Euro gesamt" if SAMMEL_MAX_PREIS else ""
     log(f"Suche: {GAESTE} Gaeste, {CHECKIN} bis {CHECKOUT} ({NAECHTE} Naechte){preis}, "
         f"max. {MAX_FAHRZEIT_STD:g} h Autofahrt ab {ZENTRUM_NAME}")
     if PUSH_AKTIV and push_thema(state):
